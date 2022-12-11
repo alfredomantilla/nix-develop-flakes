@@ -13,5 +13,8 @@
       devShells = nixpkgs.lib.genAttrs systems (system: import ./. {
         pkgs = import nixpkgs { inherit system; };
       });
+      packages = nixpkgs.lib.genAttrs systems (system: import ./. {
+        pkgs = import nixpkgs { inherit system; };
+      });
     };
 }

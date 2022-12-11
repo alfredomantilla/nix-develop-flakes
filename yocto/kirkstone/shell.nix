@@ -1,62 +1,61 @@
 
-{ pkgs ? import <nixpkgs> {}, user-shell ? "zsh", kerberos ? true, ldap ? true }:
+{ pkgs ? import <nixpkgs> {}, user-shell ? "zsh", kerberos ? true, ldap ? true , docker ? false}:
 
 let
+  shell-pkgs = if builtins.match user-shell "zsh" != null then (with pkgs; [
+        zsh
+        oh-my-zsh
+        zsh-git-prompt
+        zsh-powerlevel10k]) else if builtins.match user-shell "fish" != null then (with pkgs; [fish]) else (with pkgs; []);
+  base-pkgs = (with pkgs; [
+        attr
+        bc
+        binutils
+        bzip2
+        chrpath
+        cpio
+        diffstat
+        expect
+        file
+        gcc
+        clang
+        gdb
+        git
+        gnumake
+        hostname
+        kconfig-frontends
+        xz
+        ncurses
+        patch
+        perl
+        rpcsvc-proto
+        unzip
+        util-linux
+        wget
+        which
+        glibcLocales
+        lz4
+        zstd
+        zlib
+        nano
+        (python3.withPackages ( ps: with ps; [ jsonschema pyyaml kconfiglib distro pip (callPackage ./kas.nix {}) ]))
+        # To use ssh properly with TTTech infra and this OpenBSD version of ssh you will need a key generated with "ssh-keygen -t ed25519"
+        openssh
+        # Need this on our build machines as groups and user come from LDAP
+        sssd
+        # Needed for menuconfig
+        screen
+        ccache
+        fakeroot
+        libselinux
+        bubblewrap
+        krb5
+        dtc
+        sqlite
+      ]);
   fhs = pkgs.buildFHSUserEnvBubblewrap {
     name = "yocto-fhs-${user-shell}";
-    targetPkgs = 
-      let shell-pkgs = if builtins.match user-shell "zsh" != null then (with pkgs; [
-          zsh
-          oh-my-zsh
-          zsh-git-prompt
-          zsh-powerlevel10k]) else if builtins.match user-shell "fish" != null then (with pkgs; [fish]) else (with pkgs; []);
-        base-pkgs = (with pkgs; [
-          attr
-          bc
-          binutils
-          bzip2
-          chrpath
-          cpio
-          diffstat
-          expect
-          file
-          gcc
-          clang
-          gdb
-          git
-          gnumake
-          hostname
-          kconfig-frontends
-          xz
-          ncurses
-          patch
-          perl
-          rpcsvc-proto
-          unzip
-          util-linux
-          wget
-          which
-          glibcLocales
-          lz4
-          zstd
-          zlib
-          nano
-          (python3.withPackages ( ps: with ps; [ jsonschema pyyaml kconfiglib distro pip (callPackage ./kas.nix {}) ]))
-          # To use ssh properly with TTTech infra and this OpenBSD version of ssh you will need a key generated with "ssh-keygen -t ed25519"
-          openssh
-          # Need this on our build machines as groups and user come from LDAP
-          sssd
-          # Needed for menuconfig
-          screen
-          ccache
-          fakeroot
-          libselinux
-          bubblewrap
-          krb5
-          dtc
-          sqlite
-        ]);
-      in pkgs: (pkgs.lib.concatLists [shell-pkgs base-pkgs]);
+    targetPkgs = pkgs: (pkgs.lib.concatLists [shell-pkgs base-pkgs]);
     extraOutputsToInstall = [ "dev" "lib" "share" ];
     # Pass kerberos config to chroot if set to true
     extraBwrapArgs =
@@ -99,5 +98,12 @@ let
         export BBPOSTCONF="${nixconf}"
       '';
   };
-in fhs.env
-
+  dockerImg = pkgs.dockerTools.buildLayeredImage {
+    name = "Kirkstone Development Container ${user-shell}";
+    tag = "latest";
+    extraCommands = ''echo "(extraCommand)" > extraCommands'';
+    #config.Cmd = [ "${pkgs.hello}/bin/hello" ];
+    contents = pkgs.lib.concatLists [shell-pkgs base-pkgs];
+  };
+  Output = if docker then dockerImg else fhs.env;
+in Output
