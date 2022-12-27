@@ -6,11 +6,11 @@ let
         zsh
         oh-my-zsh
         zsh-git-prompt
-        zsh-powerlevel10k]) else if builtins.match user-shell "fish" != null then (with pkgs; [fish]) else (with pkgs; []);
+        zsh-powerlevel10k]) else if builtins.match user-shell "fish" != null then (with pkgs; [fish]) else (with pkgs; [bashInteractive]);
   base-pkgs = (with pkgs; [
         attr
         bc
-        binutils
+        binutils-unwrapped
         bzip2
         chrpath
         cpio
@@ -18,8 +18,8 @@ let
         expect
         file
         gcc
-        clang
-        gdb
+#       not really needed
+#        gdb
         git
         gnumake
         hostname
@@ -30,7 +30,8 @@ let
         perl
         rpcsvc-proto
         unzip
-        util-linux
+# has systemd and some stuff not needed
+#        util-linux
         wget
         which
         glibcLocales
@@ -45,26 +46,21 @@ let
         sssd
         # Needed for menuconfig
         screen
-        ccache
-        fakeroot
-        libselinux
-        bubblewrap
         krb5
         dtc
-        sqlite
+        gzip
+        pigz
+        gnutar
+        sudo
+#        sqlite
       ]);
-  fhs = pkgs.buildFHSUserEnvBubblewrap {
-    name = "yocto-fhs-${user-shell}";
-    targetPkgs = pkgs: (pkgs.lib.concatLists [shell-pkgs base-pkgs]);
-    extraOutputsToInstall = [ "dev" "lib" "share" ];
-    # Pass kerberos config to chroot if set to true
-    extraBwrapArgs =
-      let list = if kerberos then "--ro-bind /etc/krb5.conf /etc/krb5.conf" else "";
-      in [list]; 
-
-    runScript = "${user-shell}";
-    extraInstallCommands = "";
-    profile =
+  os-utils = (with pkgs; [ coreutils findutils gnutls gnused gnugrep gawk diffutils which libarchive dockerTools.binSh dockerTools.usrBinEnv dockerTools.fakeNss ]);
+  rootprofile = pkgs.writeText ".profile" ''
+    if [ -f /etc/profile ]; then
+      source /etc/profile
+    fi
+  '';
+  fhsprofile =
       let
         wrapperEnvar = "NIX_CC_WRAPPER_TARGET_HOST_${pkgs.stdenv.cc.suffixSalt}";
         # TODO limit export to native pkgs?
@@ -97,13 +93,106 @@ let
         # source the config for bitbake equal to --postread
         export BBPOSTCONF="${nixconf}"
       '';
+  fhs = pkgs.buildFHSUserEnvBubblewrap {
+    name = "yocto-fhs-${user-shell}";
+    targetPkgs = pkgs: (pkgs.lib.concatLists [shell-pkgs base-pkgs]);
+    extraOutputsToInstall = [ "dev" "lib" "share" ];
+    # Pass kerberos config to chroot if set to true
+    extraBwrapArgs =
+      let list = if kerberos then "--ro-bind /etc/krb5.conf /etc/krb5.conf" else "";
+      in [list]; 
+
+    runScript = "${user-shell}";
+    extraInstallCommands = "";
+    profile = "${fhsprofile}";
   };
-  dockerImg = pkgs.dockerTools.buildLayeredImage {
-    name = "Kirkstone Development Container ${user-shell}";
+  kas-os-release = let
+    filterNull = pkgs.lib.filterAttrs (_: v: v != null);
+    envFileGenerator = pkgs.lib.generators.toKeyValue { };
+    os-release-params = {
+      PORTABLE_ID = "debian";
+      PORTABLE_PRETTY_NAME = "Ubuntu 14.04.3 LTS";
+      HOME_URL = http://www.ttcontrol.com/;
+      ID = "debian";
+      PRETTY_NAME = "Potara Docker Build Distribution";
+      BUILD_ID = "rolling";
+    };
+    os-release = pkgs.writeText "os-release"
+      (envFileGenerator (filterNull os-release-params));
+  in    
+  pkgs.stdenv.mkDerivation {
+      name = "kas-os-release";
+      pname = "kas-os-release";
+
+      buildCommand = ''
+        # scaffold a file system layout
+        mkdir -p $out/etc/systemd/system $out/proc $out/sys $out/dev $out/run \
+                 $out/tmp $out/var/tmp $out/var/lib $out/var/cache $out/var/log
+        # empty files to mount over with host's version
+        touch $out/etc/resolv.conf $out/etc/machine-id
+        # required for portable services
+        cp ${os-release} $out/etc/os-release
+      '';
+  }; 
+  
+  etcProfile = pkgs.writeText "profile" ''
+    export PS1='kirkstone-devel-fusion:\u@\h:\w\$ '
+    export LOCALE_ARCHIVE='/usr/lib/locale/locale-archive'
+    export LD_LIBRARY_PATH="/run/opengl-driver/lib:/run/opengl-driver-32/lib:/usr/lib:/usr/lib32''${LD_LIBRARY_PATH:+:}$LD_LIBRARY_PATH"
+    export PATH="/run/wrappers/bin:/usr/bin:/usr/sbin:$PATH"
+    export TZDIR='/etc/zoneinfo'
+    # XDG_DATA_DIRS is used by pressure-vessel (steam proton) and vulkan loaders to find the corresponding icd
+    export XDG_DATA_DIRS=$XDG_DATA_DIRS''${XDG_DATA_DIRS:+:}/run/opengl-driver/share:/run/opengl-driver-32/share
+    # Force compilers and other tools to look in default search paths
+    unset NIX_ENFORCE_PURITY
+    export NIX_CC_WRAPPER_TARGET_HOST_${pkgs.stdenv.cc.suffixSalt}=1
+    export NIX_CFLAGS_COMPILE='-idirafter /usr/include'
+    export NIX_CFLAGS_LINK='-L/usr/lib -L/usr/lib32'
+    export NIX_LDFLAGS='-L/usr/lib -L/usr/lib32'
+    export PKG_CONFIG_PATH=/usr/lib/pkgconfig
+    export ACLOCAL_PATH=/usr/share/aclocal
+    ${fhsprofile}
+  '';
+
+  rootProfile = pkgs.writeText ".profile" ''
+    if [ -f /etc/profile ]; then
+      . /etc/profile
+    fi
+  '';
+
+  # Compose /etc for the chroot environment
+  etcPkg = pkgs.stdenv.mkDerivation {
+    name         = "docker-profile";
+    buildCommand = ''
+      mkdir -p $out/etc
+      cd $out/etc
+      # environment variables
+      ln -s ${etcProfile} profile
+      mkdir -p $out/root
+      cd $out/root
+      ln -s ${rootProfile} .profile
+      # symlink /etc/mtab -> /proc/mounts (compat for old userspace progs)
+      ln -s /proc/mounts mtab
+    '';
+  };
+
+  dockerImg = pkgs.dockerTools.buildLayeredImage   {
+    name = "kirkstone_development_container_${user-shell}";
     tag = "latest";
-    extraCommands = ''echo "(extraCommand)" > extraCommands'';
-    #config.Cmd = [ "${pkgs.hello}/bin/hello" ];
-    contents = pkgs.lib.concatLists [shell-pkgs base-pkgs];
+    config.Env = [
+      "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" 
+    ];
+    #extraCommands = ''cp ${os-release} /etc/os-release'';
+    #config.Cmd = if builtins.match user-shell "zsh" != null then [ "${pkgs.zsh}/bin/zsh" ] 
+    #     else if builtins.match user-shell "fish" != null then [ "${pkgs.fish}/bin/fish" ] 
+    #     else [ "${pkgs.bashInteractive}/bin/bash" ]; 
+    config.Cmd = pkgs.writeScript "etc-cmd" ''
+        #!${pkgs.bashInteractive}/bin/sh
+        source ${etcPkg}/etc/profile
+        ${pkgs.bashInteractive}/bin/bash
+      '';
+    contents = pkgs.lib.concatLists [ shell-pkgs base-pkgs os-utils [ kas-os-release etcPkg ] ];
+    maxLayers = 125;
   };
   Output = if docker then dockerImg else fhs.env;
 in Output
