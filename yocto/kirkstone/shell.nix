@@ -8,6 +8,7 @@ let
         zsh-git-prompt
         zsh-powerlevel10k]) else if builtins.match user-shell "fish" != null then (with pkgs; [fish]) else (with pkgs; [bashInteractive]);
   base-pkgs = (with pkgs; [
+        glibcLocales
         attr
         bc
         binutils-unwrapped
@@ -19,7 +20,7 @@ let
         file
         gcc
 #       not really needed
-#        gdb
+        gdb
         git
         gnumake
         hostname
@@ -31,10 +32,9 @@ let
         rpcsvc-proto
         unzip
 # has systemd and some stuff not needed
-#        util-linux
+        util-linux
         wget
         which
-        glibcLocales
         lz4
         zstd
         zlib
@@ -48,13 +48,23 @@ let
         screen
         krb5
         dtc
+        ccache
+        fakeroot
+        libselinux
+        bubblewrap
         gzip
         pigz
         gnutar
         sudo
-#        sqlite
+        less
+        getconf
+        bintools
+        sqlite
+        # ldd and iconv
+        (pkgs.lib.getBin pkgs.stdenv.cc.libc)
+        libgccjit
       ]);
-  os-utils = (with pkgs; [ coreutils findutils gnutls gnused gnugrep gawk diffutils which libarchive dockerTools.binSh dockerTools.usrBinEnv dockerTools.fakeNss ]);
+  os-utils = (with pkgs; [ coreutils findutils gnutls gnused gnugrep gawk diffutils which libarchive dockerTools.binSh dockerTools.usrBinEnv cacert gosu glibc.dev ]);
   rootprofile = pkgs.writeText ".profile" ''
     if [ -f /etc/profile ]; then
       source /etc/profile
@@ -96,7 +106,7 @@ let
   fhs = pkgs.buildFHSUserEnvBubblewrap {
     name = "yocto-fhs-${user-shell}";
     targetPkgs = pkgs: (pkgs.lib.concatLists [shell-pkgs base-pkgs]);
-    extraOutputsToInstall = [ "dev" "lib" "share" ];
+    extraOutputsToInstall = [ "dev" "lib" "share" "out" "bin" ];
     # Pass kerberos config to chroot if set to true
     extraBwrapArgs =
       let list = if kerberos then "--ro-bind /etc/krb5.conf /etc/krb5.conf" else "";
@@ -151,6 +161,11 @@ let
     export NIX_LDFLAGS='-L/usr/lib -L/usr/lib32'
     export PKG_CONFIG_PATH=/usr/lib/pkgconfig
     export ACLOCAL_PATH=/usr/share/aclocal
+    export NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+    # Yocto SSL certificate can cause problems with some git repos if this is not set
+    export GIT_SSL_CAINFO=$NIX_SSL_CERT_FILE
+    # Yocto SSL certificate can cause problems with some ftp repos if this is not set
+    export SSL_CERT_FILE=$NIX_SSL_CERT_FILE
     ${fhsprofile}
   '';
 
@@ -173,8 +188,38 @@ let
       ln -s ${rootProfile} .profile
       # symlink /etc/mtab -> /proc/mounts (compat for old userspace progs)
       ln -s /proc/mounts mtab
+      mkdir -p $out/usr/lib/locale
+      cd $out/usr/lib/locale
+      ln -s ${pkgs.glibcLocales}/lib/locale/locale-archive locale-archive
+      mkdir -p $out/tmp
+      chmod 1777 $out/tmp
     '';
   };
+
+  nonRootShadowSetup = { user, uid, gid ? uid }: with pkgs; [(
+      writeTextDir "etc/shadow" ''
+        root:!x:::::::
+        ${user}:!:::::::
+      ''
+      )
+      (
+      writeTextDir "etc/passwd" ''
+        root:x:0:0::/root:${runtimeShell}
+        ${user}:x:${toString uid}:${toString gid}::/home/${user}:
+      ''
+      )
+      (
+      writeTextDir "etc/group" ''
+        root:x:0:
+        ${user}:x:${toString gid}:
+      ''
+      )
+      (
+      writeTextDir "etc/gshadow" ''
+        root:x::
+        ${user}:x::
+      ''
+      )];
 
   dockerImg = pkgs.dockerTools.buildLayeredImage   {
     name = "kirkstone_development_container_${user-shell}";
@@ -182,16 +227,25 @@ let
     config.Env = [
       "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" 
     ];
-    #extraCommands = ''cp ${os-release} /etc/os-release'';
+    extraCommands = ''cp ${kas-os-release}/etc/os-release /etc/os-release 
+                      # need the /usr/include folder
+                      cp -r ${pkgs.glibc.dev}/include ./usr/
+                    '';
     #config.Cmd = if builtins.match user-shell "zsh" != null then [ "${pkgs.zsh}/bin/zsh" ] 
     #     else if builtins.match user-shell "fish" != null then [ "${pkgs.fish}/bin/fish" ] 
     #     else [ "${pkgs.bashInteractive}/bin/bash" ]; 
+    # Needed for mktemp
+    fakeRootCommands = ''
+        mkdir -p ./tmp
+        chmod 1777 ./tmp
+      '';
     config.Cmd = pkgs.writeScript "etc-cmd" ''
         #!${pkgs.bashInteractive}/bin/sh
         source ${etcPkg}/etc/profile
         ${pkgs.bashInteractive}/bin/bash
       '';
-    contents = pkgs.lib.concatLists [ shell-pkgs base-pkgs os-utils [ kas-os-release etcPkg ] ];
+    config.User = "1000:1000";
+    contents = pkgs.lib.concatLists [ shell-pkgs base-pkgs os-utils [ kas-os-release etcPkg ] ]  ++ nonRootShadowSetup { uid = 1000; user = "amn"; };
     maxLayers = 125;
   };
   Output = if docker then dockerImg else fhs.env;
